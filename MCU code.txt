@@ -1,0 +1,776 @@
+;===========================================================
+; ATmega64, 9.216 MHz
+; USART0 9600 8N1
+; RS-485 half-duplex: DE on PE2 (1=TX, 0=RX)
+;
+; TX every 50ms (Timer1): 4 bytes via UDRE ISR
+;   TX0: buttons byte0
+;   TX1: buttons byte1 (bits0..2 used)
+;   TX2: ADC8 (ADCH, left adjust)
+;   TX3: CS = ~(TX0+TX1+TX2)
+;
+; After TX complete (TXC ISR): switch to RX, start Timer0 20ms
+; RX packet 5 bytes (RX ISR):
+;   RX0,RX1: device states for LEDs
+;   RX2,RX3: LENH,LENL (u16 length)
+;   RX4: CS = ~(RX0+RX1+RX2+RX3)
+;
+; If RX OK -> update LEDs + LCD (DEC, 4 digits, leading zeros)
+; If Timer0 timeout -> RX_T0 flag, go next cycle
+;===========================================================
+
+.include "m64def.inc"
+.list
+
+;-----------------------------
+; Registers
+;-----------------------------
+.def temp_L   = r16
+.def temp_H   = r17
+.def b0       = r18
+.def b1       = r19
+.def sum      = r20      ; checksum accumulator for RX[0..3]
+.def rx_cnt   = r21      ; RX index 0..4
+.def tx_cnt   = r22      ; TX index 0..4
+.def flags    = r23
+.def digit    = r24
+.def work     = r25
+
+;-----------------------------
+; Flags in flags register
+;-----------------------------
+.equ F_TX_50MS = 0        ; set by Timer1 each 50ms
+.equ F_RX_OK   = 1        ; set when valid RX packet received
+.equ F_RX_T0   = 2        ; set on Timer0 20ms timeout
+
+;-----------------------------
+; RS-485 DE pin
+;-----------------------------
+.equ RS485_DE_BIT = 2     ; PE2
+
+;-----------------------------
+; Timer settings
+; Timer1: 50ms, CTC, prescaler /64
+; 9.216MHz / 64 = 144kHz, 50ms => 7200 ticks => OCR1A=7199
+; Timer0: 20ms, CTC, prescaler /1024
+; 9.216MHz /1024 = 9000Hz, 20ms => 180 ticks => OCR0=179
+;-----------------------------
+.equ OCR1A_50MS = 7199
+.equ OCR0_20MS  = 179
+;===========================================================
+; SRAM
+;===========================================================
+.DSEG
+usart_Txd: .BYTE 4
+usart_Rxd: .BYTE 5
+lcd_buf:   .BYTE 4         ; 4 ASCII digits (thousands..ones)
+;===========================================================
+; VECTORS
+;===========================================================
+.CSEG
+.org 0x0000
+rjmp RESET
+
+.org OC1Aaddr              ; Timer1 Compare A (50ms tick)
+rjmp T1_50MS_ISR
+
+.org OC0addr               ; Timer0 Compare (20ms timeout)
+rjmp T0_TIMEOUT_ISR
+
+.org UDREaddr              ; USART0 Data Register Empty
+rjmp USART_UDRE_ISR
+
+.org UTXCaddr              ; USART0 TX Complete
+rjmp USART_TXC_ISR
+
+.org URXCaddr              ; USART0 RX Complete
+rjmp USART_RX_ISR
+
+.org ADCCaddr              ; ADC Conversion Complete
+rjmp ADC_ISR
+;===========================================================
+; RESET / INIT
+;===========================================================
+RESET:
+    ; stack
+    ldi temp_L, low(RAMEND)
+    out SPL, temp_L
+    ldi temp_L, high(RAMEND)
+    out SPH, temp_L
+
+    clr __zero_reg__
+
+    ;-------------------------
+    ; Ports
+    ;-------------------------
+    ; Buttons: PE4..PE7 input + pull-up
+    cbi DDRE,4
+    cbi DDRE,5
+    cbi DDRE,6
+    cbi DDRE,7
+    sbi PORTE,4
+    sbi PORTE,5
+    sbi PORTE,6
+    sbi PORTE,7
+
+    ; RS485 DE on PE2 output, start RX (DE=0)
+    sbi DDRE, RS485_DE_BIT
+    cbi PORTE, RS485_DE_BIT
+
+    ; Buttons: PB0..PB6 input + pull-up, PB7 LED output
+    ldi temp_L, 0b10000000
+    out DDRB, temp_L
+    ldi temp_L, 0b01111111
+    out PORTB, temp_L
+    sbi DDRB,7
+
+    ; LEDs: PD2..PD7 output
+    ldi temp_L, 0b11111100
+    out DDRD, temp_L
+
+    ; LEDs: PG0,PG1,PG3,PG4 output
+    sbi DDRG,0
+    sbi DDRG,1
+    sbi DDRG,3
+    sbi DDRG,4
+
+    ; LCD: RS(A0)=PA5, E=PA6, RW=PA7, DATA=PC0..PC7
+    sbi DDRA,5
+    sbi DDRA,6
+    sbi DDRA,7
+    cbi PORTA,6
+    cbi PORTA,7
+    ldi temp_L, 0xFF
+    out DDRC, temp_L
+    ;-------------------------
+    ; USART0 9600 8N1 @9.216MHz
+    ; UBRR=59, U2X=0
+    ;-------------------------
+    ldi temp_L, 59
+    clr temp_H
+    out UBRR0L, temp_L
+    out UBRR0H, temp_H
+    ldi temp_L, (1<<UCSZ01)|(1<<UCSZ00)
+    out UCSR0C, temp_L
+
+    ; start in RX enabled, TX enabled (TX used when needed)
+    ldi temp_L, (1<<RXEN0)|(1<<RXCIE0)|(1<<TXEN0)
+    out UCSR0B, temp_L
+    ;-------------------------
+    ; ADC: AVCC, left adjust, ADC0, interrupt, prescaler /64
+    ;-------------------------
+    ldi temp_L, (1<<REFS0)|(1<<ADLAR)
+    out ADMUX, temp_L
+    ldi temp_L, (1<<ADEN)|(1<<ADIE)|(1<<ADPS2)|(1<<ADPS1)
+    out ADCSRA, temp_L
+    ;-------------------------
+    ; Timer1: 50ms tick (CTC, OCR1A, prescaler /64)
+    ;-------------------------
+    ldi temp_L, low(OCR1A_50MS)
+    out OCR1AL, temp_L
+    ldi temp_L, high(OCR1A_50MS)
+    out OCR1AH, temp_L
+
+    ; CTC WGM12=1
+    ldi temp_L, (1<<WGM12)
+    out TCCR1B, temp_L
+    ; enable OCIE1A
+    in  temp_L, TIMSK
+    sbr temp_L, (1<<OCIE1A)
+    out TIMSK, temp_L
+    ; prescaler /64: CS11=1, CS10=1
+    in  temp_L, TCCR1B
+    ori temp_L, (1<<CS11)|(1<<CS10)
+    out TCCR1B, temp_L
+    ;-------------------------
+    ; Timer0 off initially (used only for 20ms RX timeout)
+    ;-------------------------
+    clr temp_L
+    out TCCR0, temp_L
+    out TCNT0, temp_L
+    out OCR0,  temp_L
+    in  temp_L, TIMSK
+    cbr temp_L, (1<<OCIE0)
+    out TIMSK, temp_L
+    ;-------------------------
+    ; Vars
+    ;-------------------------
+    clr flags
+    clr rx_cnt
+    clr sum
+    clr tx_cnt
+
+    ; LCD init
+    rcall lcd_init
+
+    sei
+;===========================================================
+; MAIN LOOP (as your block-scheme)
+;===========================================================
+main_loop:
+    ; wait 50ms tick
+    sbrs flags, F_TX_50MS
+    rjmp main_loop
+    cbr  flags, (1<<F_TX_50MS)
+
+    ; read buttons -> TX0,TX1
+    rcall read_buttons_11
+    ; start ADC (TX2 updated by ISR when ready)
+    rcall adc_start
+    ; checksum -> TX3
+    rcall make_tx_checksum4
+
+    ; start TX via UDRE
+    rcall usart_start_tx_udre
+
+wait_answer:
+    ; if RX_OK -> process
+    sbrc flags, F_RX_OK
+    rjmp got_answer
+
+    ; if RX_T0 -> timeout, leave wait
+    sbrc flags, F_RX_T0
+    rjmp timeout_answer
+
+    rjmp wait_answer
+
+got_answer:
+    cbr flags, (1<<F_RX_OK)
+    rcall set_lights_from_rx
+    rcall lcd_prepare_len_dec_rx   ; includes write to LCD
+    rjmp main_loop
+
+timeout_answer:
+    cbr flags, (1<<F_RX_T0)
+    ; просто идём на следующий 50мс цикл
+    rjmp main_loop
+;===========================================================
+; RS-485 helpers
+;===========================================================
+rs485_tx_on:
+    sbi PORTE, RS485_DE_BIT
+    ret
+rs485_rx_on:
+    cbi PORTE, RS485_DE_BIT
+    ret
+;===========================================================
+; Buttons -> TX[0],TX[1] (1=pressed)
+; TX0: bit0..3=PE4..7, bit4..7=PB0..3
+; TX1: bit0..2=PB4..6, others 0
+;===========================================================
+read_buttons_11:
+    in  temp_L, PINE
+    in  temp_H, PINB
+
+    ; TX0 low nibble from PE4..PE7 -> bits0..3
+    mov b0, temp_L
+    andi b0, 0b11110000
+    lsr b0
+    lsr b0
+    lsr b0
+    lsr b0
+
+    ; TX0 high nibble from PB0..PB3 -> bits4..7
+    mov b1, temp_H
+    andi b1, 0b00001111
+    lsl b1
+    lsl b1
+    lsl b1
+    lsl b1
+    or  b0, b1
+    com b0                  ; pull-up invert (pressed=1)
+    sts usart_Txd+0, b0
+
+    ; TX1 from PB4..PB6 -> bits0..2
+    mov b0, temp_H
+    andi b0, 0b01110000
+    lsr b0
+    lsr b0
+    lsr b0
+    lsr b0
+    com b0
+    andi b0, 0b00000111
+    sts usart_Txd+1, b0
+    ret
+;===========================================================
+; ADC start / ISR: writes ADCH into TX[2]
+;===========================================================
+adc_start:
+    in   temp_L, ADCSRA
+    ori  temp_L, (1<<ADSC)
+    out  ADCSRA, temp_L
+    ret
+
+ADC_ISR:
+    push temp_L
+    in   temp_L, SREG
+    push temp_L
+    in   temp_L, ADCH
+    sts  usart_Txd+2, temp_L
+    pop  temp_L
+    out  SREG, temp_L
+    pop  temp_L
+    reti
+;===========================================================
+; TX checksum: TX[3] = ~(TX0+TX1+TX2)
+;===========================================================
+make_tx_checksum4:
+    lds b0, usart_Txd+0
+    lds b1, usart_Txd+1
+    lds work, usart_Txd+2
+    add b0, b1
+    add b0, work
+    com b0
+    sts usart_Txd+3, b0
+    ret
+;===========================================================
+; Start TX using UDRE ISR (4 bytes)
+;===========================================================
+usart_start_tx_udre:
+    ; close RX flags for new cycle
+    cbr flags, (1<<F_RX_OK)
+    cbr flags, (1<<F_RX_T0)
+
+    ; stop Timer0 if still running (safety)
+    rcall stop_timer0
+
+    ; RS-485 to TX
+    rcall rs485_tx_on
+
+    ; disable RX interrupt + receiver
+    in  temp_L, UCSR0B
+    cbr temp_L, (1<<RXEN0)|(1<<RXCIE0)
+    out UCSR0B, temp_L
+
+    ; TX counter
+    clr tx_cnt
+
+    ; clear TXC (write 1)
+    sbi UCSR0A, TXC0
+
+    ; preload first byte
+    lds b0, usart_Txd+0
+    out UDR0, b0
+    inc tx_cnt
+
+    ; enable UDRE interrupt, TX already enabled
+    in  temp_L, UCSR0B
+    sbr temp_L, (1<<UDRIE0)
+    out UCSR0B, temp_L
+    ret
+;===========================================================
+; USART UDRE ISR: feed remaining bytes
+; After last byte loaded -> disable UDRIE, enable TXCIE
+;===========================================================
+USART_UDRE_ISR:
+    push temp_L
+    in   temp_L, SREG
+    push temp_L
+    push b0
+
+    ; tx_cnt: already sent 1..4
+    cpi tx_cnt, 4
+    brsh udre_done
+
+    ; load next byte usart_Txd[tx_cnt]
+    ldi ZL, low(usart_Txd)
+    ldi ZH, high(usart_Txd)
+    add ZL, tx_cnt
+    adc ZH, __zero_reg__
+    ld  b0, Z
+    out UDR0, b0
+    inc tx_cnt
+
+    ; if now tx_cnt == 4 -> last byte has been loaded to UDR, enable TXCIE, disable UDRIE
+    cpi tx_cnt, 4
+    brne udre_exit
+
+    in  b0, UCSR0B
+    cbr b0, (1<<UDRIE0)
+    sbr b0, (1<<TXCIE0)
+    out UCSR0B, b0
+    rjmp udre_exit
+
+udre_done:
+    ; safety: disable UDRE
+    in  b0, UCSR0B
+    cbr b0, (1<<UDRIE0)
+    out UCSR0B, b0
+
+udre_exit:
+    pop  b0
+    pop  temp_L
+    out  SREG, temp_L
+    pop  temp_L
+    reti
+;===========================================================
+; USART TXC ISR: TX physically finished
+;===========================================================
+USART_TXC_ISR:
+    push temp_L
+    in   temp_L, SREG
+    push temp_L
+    push b0
+
+    ; disable TXCIE
+    in  b0, UCSR0B
+    cbr b0, (1<<TXCIE0)
+    out UCSR0B, b0
+
+    ; RS-485 to RX
+    rcall rs485_rx_on
+
+    ; reset RX collector
+    clr rx_cnt
+    clr sum
+
+    ; enable RX + RX interrupt
+    in  b0, UCSR0B
+    sbr b0, (1<<RXEN0)|(1<<RXCIE0)
+    out UCSR0B, b0
+
+    ; start Timer0 20ms window
+    rcall start_timer0_20ms
+
+    pop  b0
+    pop  temp_L
+    out  SREG, temp_L
+    pop  temp_L
+    reti
+;===========================================================
+; USART RX ISR: collect 5 bytes, check checksum
+;===========================================================
+USART_RX_ISR:
+    push temp_L
+    in   temp_L, SREG
+    push temp_L
+    push b0
+    push ZL
+    push ZH
+
+    in  b0, UDR0
+
+    ; store in usart_Rxd[rx_cnt]
+    ldi ZL, low(usart_Rxd)
+    ldi ZH, high(usart_Rxd)
+    add ZL, rx_cnt
+    adc ZH, __zero_reg__
+    st  Z, b0
+
+    ; if rx_cnt < 4 -> sum += byte
+    cpi rx_cnt, 4
+    brsh rx_got_cs
+    add sum, b0
+    inc rx_cnt
+    rjmp rx_exit
+
+rx_got_cs:
+    ; b0 is RX checksum byte (RX[4])
+    com b0
+    cp  b0, sum
+    brne rx_bad
+
+    ; OK packet
+    sbr flags, (1<<F_RX_OK)
+
+    ; stop Timer0 window
+    rcall stop_timer0
+
+    ; disable RX to avoid garbage until next cycle (по твоей логике)
+    in  b0, UCSR0B
+    cbr b0, (1<<RXEN0)|(1<<RXCIE0)
+    out UCSR0B, b0
+
+rx_bad:
+    ; reset collector for next frame
+    clr rx_cnt
+    clr sum
+
+rx_exit:
+    pop ZH
+    pop ZL
+    pop b0
+    pop temp_L
+    out SREG, temp_L
+    pop temp_L
+    reti
+;===========================================================
+; Timer0 20ms window
+;===========================================================
+start_timer0_20ms:
+    ; set OCR0
+    ldi temp_L, OCR0_20MS
+    out OCR0, temp_L
+    clr temp_L
+    out TCNT0, temp_L
+
+    ; enable OCIE0
+    in  temp_L, TIMSK
+    sbr temp_L, (1<<OCIE0)
+    out TIMSK, temp_L
+
+    ; CTC WGM01=1, prescaler /1024 (CS02=1,CS00=1)
+    ldi temp_L, (1<<WGM01)|(1<<CS02)|(1<<CS00)
+    out TCCR0, temp_L
+    ret
+
+stop_timer0:
+    clr temp_L
+    out TCCR0, temp_L
+    in  temp_L, TIMSK
+    cbr temp_L, (1<<OCIE0)
+    out TIMSK, temp_L
+    ret
+
+T0_TIMEOUT_ISR:
+    push temp_L
+    in   temp_L, SREG
+    push temp_L
+    push b0
+
+    rcall stop_timer0
+
+    ; set timeout flag
+    sbr flags, (1<<F_RX_T0)
+
+    ; disable RX (закрываем окно ожидания)
+    in  b0, UCSR0B
+    cbr b0, (1<<RXEN0)|(1<<RXCIE0)
+    out UCSR0B, b0
+
+    ; reset collector
+    clr rx_cnt
+    clr sum
+
+    pop  b0
+    pop  temp_L
+    out  SREG, temp_L
+    pop  temp_L
+    reti
+;===========================================================
+; Timer1 50ms tick ISR
+;===========================================================
+T1_50MS_ISR:
+    push temp_L
+    in   temp_L, SREG
+    push temp_L
+    sbr  flags, (1<<F_TX_50MS)
+    pop  temp_L
+    out  SREG, temp_L
+    pop  temp_L
+    reti
+;===========================================================
+; LEDs mapping from RX[0], RX[1]
+; RX0: bit0=PB7, bit1..6=PD2..PD7, bit7=PG0
+; RX1: bit0=PG1, bit1=PG3, bit2=PG4
+;===========================================================
+set_lights_from_rx:
+    lds b0, usart_Rxd+0
+    lds b1, usart_Rxd+1
+
+    ; PB7
+    sbrc b0,0
+    sbi  PORTB,7
+    sbrs b0,0
+    cbi  PORTB,7
+
+    ; PD2..PD7
+    sbrc b0,1  ; PD2
+    sbi PORTD,2
+    sbrs b0,1
+    cbi PORTD,2
+
+    sbrc b0,2  ; PD3
+    sbi PORTD,3
+    sbrs b0,2
+    cbi PORTD,3
+
+    sbrc b0,3  ; PD4
+    sbi PORTD,4
+    sbrs b0,3
+    cbi PORTD,4
+
+    sbrc b0,4  ; PD5
+    sbi PORTD,5
+    sbrs b0,4
+    cbi PORTD,5
+
+    sbrc b0,5  ; PD6
+    sbi PORTD,6
+    sbrs b0,5
+    cbi PORTD,6
+
+    sbrc b0,6  ; PD7
+    sbi PORTD,7
+    sbrs b0,6
+    cbi PORTD,7
+
+    ; PG0
+    sbrc b0,7
+    sbi PORTG,0
+    sbrs b0,7
+    cbi PORTG,0
+
+    ; PG1, PG3, PG4
+    sbrc b1,0
+    sbi PORTG,1
+    sbrs b1,0
+    cbi PORTG,1
+
+    sbrc b1,1
+    sbi PORTG,3
+    sbrs b1,1
+    cbi PORTG,3
+
+    sbrc b1,2
+    sbi PORTG,4
+    sbrs b1,2
+    cbi PORTG,4
+
+    ret
+;===========================================================
+; LCD (8-bit) low-level
+; RS(A0)=PA5, E=PA6, RW=PA7, DATA=PORTC
+;===========================================================
+lcd_delay:
+    ldi work, 60
+lcd_d1:
+    dec work
+    brne lcd_d1
+    ret
+
+lcd_pulse_e:
+    sbi PORTA,6
+    rcall lcd_delay
+    cbi PORTA,6
+    rcall lcd_delay
+    ret
+
+lcd_cmd:
+    cbi PORTA,5       ; RS=0
+    cbi PORTA,7       ; RW=0
+    out PORTC, r16
+    rcall lcd_pulse_e
+    ret
+
+lcd_data:
+    sbi PORTA,5       ; RS=1
+    cbi PORTA,7       ; RW=0
+    out PORTC, r16
+    rcall lcd_pulse_e
+    ret
+
+lcd_init:
+    ; Function set 8-bit,2-line
+    ldi r16, 0x38
+    rcall lcd_cmd
+    ; Display ON
+    ldi r16, 0x0C
+    rcall lcd_cmd
+    ; Clear
+    ldi r16, 0x01
+    rcall lcd_cmd
+    rcall lcd_delay
+    rcall lcd_delay
+    ; Entry mode
+    ldi r16, 0x06
+    rcall lcd_cmd
+    ret
+
+lcd_goto:
+    ori r16, 0x80
+    rcall lcd_cmd
+    ret
+
+;===========================================================
+; LCD: prepare DEC(4 digits) from RX[2..3] and WRITE inside
+;===========================================================
+lcd_prepare_len_dec_rx:
+    ; load LEN into temp_H:temp_L
+    lds temp_H, usart_Rxd+2   ; LENH
+    lds temp_L, usart_Rxd+3   ; LENL
+
+    ; convert u16 -> 4 digits in lcd_buf
+    rcall u16_to_4digits_buf
+
+    ; write 4 digits to LCD
+    rcall lcd_write_buf4
+    ret
+
+; Convert u16 (temp_H:temp_L) to 4 ASCII digits (0000..9999) into lcd_buf
+; Method: repeated subtraction (1000,100,10) -> digits, remainder -> ones
+u16_to_4digits_buf:
+    ; Z -> lcd_buf
+    ldi ZL, low(lcd_buf)
+    ldi ZH, high(lcd_buf)
+
+    ; thousands
+    clr digit
+u16_th_loop:
+    ; if LEN < 1000 -> stop
+    cpi temp_H, high(1000)
+    cpc temp_L, low(1000)
+    brlo u16_th_done
+    subi temp_L, low(1000)
+    sbci temp_H, high(1000)
+    inc digit
+    rjmp u16_th_loop
+u16_th_done:
+    ldi b0, '0'
+    add b0, digit
+    st  Z+, b0
+
+    ; hundreds
+    clr digit
+u16_h_loop:
+    cpi temp_H, high(100)
+    cpc temp_L, low(100)
+    brlo u16_h_done
+    subi temp_L, low(100)
+    sbci temp_H, high(100)
+    inc digit
+    rjmp u16_h_loop
+u16_h_done:
+    ldi b0, '0'
+    add b0, digit
+    st  Z+, b0
+
+    ; tens
+    clr digit
+u16_t_loop:
+    cpi temp_H, high(10)
+    cpc temp_L, low(10)
+    brlo u16_t_done
+    subi temp_L, low(10)
+    sbci temp_H, high(10)
+    inc digit
+    rjmp u16_t_loop
+u16_t_done:
+    ldi b0, '0'
+    add b0, digit
+    st  Z+, b0
+
+    ; ones = temp_L (0..9)
+    ldi b0, '0'
+    add b0, temp_L
+    st  Z, b0
+    ret
+
+lcd_write_buf4:
+    ; line1 pos0
+    ldi r16, 0x00
+    rcall lcd_goto
+
+    ldi ZL, low(lcd_buf)
+    ldi ZH, high(lcd_buf)
+
+    ldi work, 4
+lcd_w4:
+    ld  r16, Z+
+    rcall lcd_data
+    dec work
+    brne lcd_w4
+    ret
+;===========================================================
+; END
+;===========================================================
